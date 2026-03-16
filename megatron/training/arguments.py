@@ -1221,6 +1221,24 @@ def validate_args(args, defaults={}):
         assert is_te_min_version("2.9.0"), \
             '--log-max-attention-logit is only supported with TE >= 2.9.0.'
 
+    if args.enable_energy_tracker and args.timing_log_level < 2:
+        warn_rank_0(
+            '--enable-energy-tracker requires level-2 timers; setting --timing-log-level to 2.'
+        )
+        args.timing_log_level = 2
+
+    if args.simulated_gpu_count is not None:
+        assert args.simulated_gpu_count > 0, '--simulated-gpu-count must be greater than zero.'
+        if not args.enable_energy_tracker:
+            warn_rank_0(
+                '--simulated-gpu-count has no effect unless --enable-energy-tracker is also set.'
+            )
+        elif args.simulated_gpu_count <= args.world_size:
+            warn_rank_0(
+                '--simulated-gpu-count is less than or equal to the real world size; '
+                'extrapolated totals will not exceed the current run.'
+            )
+
     if args.decoupled_lr is not None or args.decoupled_min_lr is not None:
         assert not args.use_legacy_models, \
             '--decoupled-lr and --decoupled-min-lr is not supported in legacy models.'

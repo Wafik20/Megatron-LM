@@ -318,6 +318,15 @@ class LoggerConfig:
     log_energy: bool = False
     """If set, log energy consumption (in Joules)."""
 
+    enable_energy_tracker: bool = False
+    """Enable timer-based per-iteration energy estimates during training."""
+
+    energy_tracker_csv_path: str | None = None
+    """Optional CSV output path for timer-based energy logs. Defaults to `energy_log.csv`."""
+
+    simulated_gpu_count: int | None = None
+    """Optional extrapolated GPU count for timer-based energy totals."""
+
     save_config_filepath: str | None = None
     """If set, save the task configuration (ConfigContainer) to this file."""
 

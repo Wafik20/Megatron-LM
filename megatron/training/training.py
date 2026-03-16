@@ -204,6 +204,7 @@ from . import ft_integration
 stimer = StragglerDetector()
 
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
+from megatron.energy import EnergyTracker, PowerModel, TrainingEnergyTracker
 
 
 def destroy_global_state():
@@ -224,6 +225,12 @@ def print_datetime(string, override_timestamp=None):
     else:
         time_str = datetime.fromtimestamp(override_timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')
     print_rank_0(f'[{string}] datetime: {time_str} ')
+
+
+def _resolve_energy_tracker_csv_path(args) -> Path:
+    if args.energy_tracker_csv_path:
+        return Path(args.energy_tracker_csv_path)
+    return Path("energy_log.csv")
 
 def num_floating_point_operations(args, batch_size):
     def mlp_layer_flops(batch_size, seq_len, hidden_size, expansion=4.0, swiglu=False):
@@ -1860,6 +1867,7 @@ def training_log(
     params_norm,
     num_zeros_in_grad,
     max_attention_logit,
+    energy_summary=None,
     pg_collection=None,
     is_first_iteration=False,
 ):
@@ -2192,6 +2200,41 @@ def training_log(
         # Log timers to stdout
         timers.log(timers_to_log, normalizer=args.log_interval, reset=should_reset)
 
+    if energy_summary is not None:
+        if writer and (iteration % args.tensorboard_log_interval == 0):
+            phase_energy = energy_summary["phase_energy"]
+            writer.add_scalar("energy/total_j", energy_summary["total_energy_j"], iteration)
+            writer.add_scalar("energy/avg_power_w", energy_summary["avg_power_w"], iteration)
+            writer.add_scalar("energy/forward_j", phase_energy["forward"], iteration)
+            writer.add_scalar("energy/backward_j", phase_energy["backward"], iteration)
+            writer.add_scalar("energy/comm_j", phase_energy["comm"], iteration)
+            writer.add_scalar("energy/optimizer_j", phase_energy["optimizer"], iteration)
+            writer.add_scalar("energy/idle_j", phase_energy["idle"], iteration)
+            if "simulated_total_energy_j" in energy_summary:
+                writer.add_scalar(
+                    "energy/simulated_total_j", energy_summary["simulated_total_energy_j"], iteration
+                )
+                writer.add_scalar(
+                    "energy/simulated_total_power_w",
+                    energy_summary["simulated_total_power_w"],
+                    iteration,
+                )
+        if wandb_writer:
+            wandb_payload = {
+                "energy/total_j": energy_summary["total_energy_j"],
+                "energy/avg_power_w": energy_summary["avg_power_w"],
+                "energy/forward_j": energy_summary["phase_energy"]["forward"],
+                "energy/backward_j": energy_summary["phase_energy"]["backward"],
+                "energy/comm_j": energy_summary["phase_energy"]["comm"],
+                "energy/optimizer_j": energy_summary["phase_energy"]["optimizer"],
+                "energy/idle_j": energy_summary["phase_energy"]["idle"],
+            }
+            if "simulated_total_energy_j" in energy_summary:
+                wandb_payload["energy/simulated_total_j"] = energy_summary["simulated_total_energy_j"]
+                wandb_payload["energy/simulated_total_power_w"] = energy_summary["simulated_total_power_w"]
+            wandb_writer.log(wandb_payload, iteration)
+        print_rank_0(TrainingEnergyTracker.format_log(iteration, energy_summary))
+
     return report_memory_flag
 
 
@@ -2262,6 +2305,7 @@ def save_checkpoint_and_time(
     args = get_args()
     timers = get_timers()
     energy_monitor = get_energy_monitor()
+    iteration_energy_tracker = None
 
     # Synchronize forward pre-hook state before checkpoint save to avoid race conditions
     if should_disable_forward_pre_hook(args):
@@ -2671,7 +2715,17 @@ def train(
         energy_monitor.setup()
         energy_monitor.resume()
 
+    if args.enable_energy_tracker:
+        csv_path = _resolve_energy_tracker_csv_path(args) if args.rank == 0 else None
+        iteration_energy_tracker = TrainingEnergyTracker(
+            EnergyTracker(PowerModel()),
+            csv_path=csv_path,
+            simulated_gpu_count=args.simulated_gpu_count,
+        )
+
     timers('interval-time', log_level=0).start(barrier=True)
+    if iteration_energy_tracker is not None:
+        iteration_energy_tracker.prime(timers)
     print_datetime('before the start of training step')
     report_memory_flag = True
     pre_hook_enabled = False
@@ -2797,6 +2851,8 @@ def train(
     # Run training iterations till done.
     buffered_rollouts = None
     while iteration < args.train_iters:
+        if iteration_energy_tracker is not None:
+            iteration_energy_tracker.start_iteration()
         if (args.profile 
             and (len(args.profile_ranks) == 0 or
                  torch.distributed.get_rank() in args.profile_ranks)):
@@ -2877,6 +2933,8 @@ def train(
             )
             args.consumed_train_samples += batch_size
             args.skipped_train_samples += batch_size
+            if iteration_energy_tracker is not None:
+                iteration_energy_tracker.prime(timers)
             continue
 
         args.curr_iteration = iteration
@@ -3013,6 +3071,9 @@ def train(
         num_floating_point_operations_in_batch = num_floating_point_operations(args, batch_size)
         num_floating_point_operations_so_far += num_floating_point_operations_in_batch
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
+        energy_summary = None
+        if iteration_energy_tracker is not None:
+            energy_summary = iteration_energy_tracker.record_iteration(timers, iteration)
 
         # Logging.
         if optimizer is not None and not optimizer.is_stub_optimizer:
@@ -3039,6 +3100,7 @@ def train(
             params_norm,
             num_zeros_in_grad,
             max_attention_logit,
+            energy_summary=energy_summary,
             pg_collection=model_pg_collection,
             is_first_iteration=is_first_iteration,
         )
