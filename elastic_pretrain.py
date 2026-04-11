@@ -280,6 +280,7 @@ def main():
     from megatron.core import parallel_state as mpu
     from megatron.core.enums import ModelType
     from megatron.core.pipeline_parallel import get_forward_backward_func
+    from megatron.core.rerun_state_machine import RerunDataIterator
 
     model_provider_func = partial(model_provider, gpt_builder)
 
@@ -297,7 +298,6 @@ def main():
         args.num_layers, args.num_attention_heads,
     )
 
-    # Verify first phase matches what Megatron initialized with
     assert schedule[0]['tp'] == args.tensor_model_parallel_size, \
         f"First phase TP={schedule[0]['tp']} != Megatron TP={args.tensor_model_parallel_size}"
     assert schedule[0]['pp'] == args.pipeline_model_parallel_size, \
@@ -319,9 +319,8 @@ def main():
         print("=" * 70 + "\n")
 
     # ── 4. Run phases ─────────────────────────────────────────────
-    forward_backward_func = get_forward_backward_func()
     phase_results = []
-    data_iter = iter(infinite_data_iterator())
+    data_iter = RerunDataIterator(iter(infinite_data_iterator()))
 
     for phase_idx, phase in enumerate(schedule):
         tp, pp, dp = phase['tp'], phase['pp'], phase['dp']
@@ -380,6 +379,9 @@ def main():
 
         t_reconfig = time.perf_counter() - t_reconfig_start
 
+        # Get the correct pipeline schedule for this PP configuration
+        forward_backward_func = get_forward_backward_func()
+
         # ── 4c. Training loop ─────────────────────────────────────
         config = core_transformer_config_from_args(args)
         num_steps = phase['end_step'] - iteration
@@ -392,8 +394,9 @@ def main():
         log_interval = args.log_interval
 
         for step_i in range(num_steps):
-            loss_dict, skipped_iter, grad_norm, num_zeros = train_step(
-                forward_step, data_iter, model, optimizer, opt_param_scheduler, config, forward_backward_func
+            loss_dict, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros, max_attn_logit = train_step(
+                forward_step, data_iter, model, optimizer, opt_param_scheduler,
+                config, forward_backward_func
             )
             iteration += 1
 
