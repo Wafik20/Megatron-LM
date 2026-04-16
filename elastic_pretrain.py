@@ -211,6 +211,41 @@ def infinite_data_iterator():
 
 
 # ═══════════════════════════════════════════════════════════════
+# Loss gathering across pipeline stages
+# ═══════════════════════════════════════════════════════════════
+
+def get_loss_for_logging(loss_dict):
+    """
+    Extract scalar loss value, broadcasting from the last PP stage to all ranks.
+
+    train_step returns the loss on the last pipeline-parallel rank only; other
+    PP ranks receive an empty loss_dict. In a PP=1 config every rank is the last
+    stage so this is a no-op, but with PP>1 rank 0 would print 0.0 without this
+    broadcast. We broadcast within the pipeline group so every rank in the
+    pipeline (and transitively global rank 0, which is PP-rank-0 of its pipeline)
+    sees the correct value.
+    """
+    from megatron.core import parallel_state as mpu
+
+    lm_loss_tensor = loss_dict.get('lm loss', None)
+    device = torch.cuda.current_device()
+
+    if lm_loss_tensor is not None and torch.is_tensor(lm_loss_tensor):
+        local_loss = lm_loss_tensor.detach().float().view(1)
+    else:
+        local_loss = torch.zeros(1, device=device, dtype=torch.float32)
+
+    if mpu.get_pipeline_model_parallel_world_size() > 1:
+        torch.distributed.broadcast(
+            local_loss,
+            src=mpu.get_pipeline_model_parallel_last_rank(),
+            group=mpu.get_pipeline_model_parallel_group(),
+        )
+
+    return local_loss.item()
+
+
+# ═══════════════════════════════════════════════════════════════
 # Args Helpers
 # ═══════════════════════════════════════════════════════════════
 
@@ -316,7 +351,7 @@ def main():
         for p in schedule:
             print(f"  Phase {p['phase']}: steps {p['start_step']:>5}->{p['end_step']:<5} "
                   f"  DP={p['dp']} TP={p['tp']} PP={p['pp']}")
-        print("=" * 70 + "\n")
+        print("=" * 70 + "\n", flush=True)
 
     # ── 4. Run phases ─────────────────────────────────────────────
     phase_results = []
@@ -330,23 +365,25 @@ def main():
             print(f"\n{'=' * 70}")
             print(f"  PHASE {phase['phase']}: steps {phase['start_step']}->{phase['end_step']}  "
                   f"(DP={dp}, TP={tp}, PP={pp})")
-            print(f"{'=' * 70}")
+            print(f"{'=' * 70}", flush=True)
 
         t_reconfig_start = time.perf_counter()
 
         # ── 4a. Reconfigure parallel state (skip for first phase) ──
         if not is_first:
             if rank == 0:
-                print("  [reconfig] Destroying old parallel state...")
+                print("  [reconfig] Destroying old parallel state...", flush=True)
             t0 = time.perf_counter()
-            destroy_model_parallel_with_nccl_cleanup()
+            mpu.destroy_model_parallel()
             if rank == 0:
-                print(f"  [reconfig] destroy_model_parallel: {time.perf_counter()-t0:.2f}s")
+                print(f"  [reconfig] destroy_model_parallel: {time.perf_counter()-t0:.2f}s",
+                      flush=True)
 
             update_args_for_phase(args, phase, ckpt_dir, is_first)
 
             if rank == 0:
-                print(f"  [reconfig] Reinitializing model parallel: TP={tp}, PP={pp}")
+                print(f"  [reconfig] Reinitializing model parallel: TP={tp}, PP={pp}",
+                      flush=True)
             t0 = time.perf_counter()
 
             dist.barrier()
@@ -355,13 +392,14 @@ def main():
                 pipeline_model_parallel_size=pp,
             )
             if rank == 0:
-                print(f"  [reconfig] initialize_model_parallel: {time.perf_counter()-t0:.2f}s")
+                print(f"  [reconfig] initialize_model_parallel: {time.perf_counter()-t0:.2f}s",
+                      flush=True)
         else:
             update_args_for_phase(args, phase, ckpt_dir, is_first)
 
         # ── 4b. Build model + optimizer ───────────────────────────
         if rank == 0:
-            print("  [build] Constructing model and optimizer...")
+            print("  [build] Constructing model and optimizer...", flush=True)
         t0 = time.perf_counter()
 
         model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
@@ -375,7 +413,7 @@ def main():
             print(f"  [build] Model + optimizer + checkpoint: {t_build:.2f}s")
             print(f"  [build] Resuming from iteration: {iteration}")
             alloc = torch.cuda.memory_allocated() / 1e9
-            print(f"  [build] GPU memory allocated: {alloc:.2f}GB")
+            print(f"  [build] GPU memory allocated: {alloc:.2f}GB", flush=True)
 
         t_reconfig = time.perf_counter() - t_reconfig_start
 
@@ -387,7 +425,7 @@ def main():
         num_steps = phase['end_step'] - iteration
         if rank == 0:
             print(f"\n  [train] Training {num_steps} steps "
-                  f"(iter {iteration}->{phase['end_step']})...")
+                  f"(iter {iteration}->{phase['end_step']})...", flush=True)
 
         t_train_start = time.perf_counter()
         losses_this_phase = []
@@ -400,11 +438,10 @@ def main():
             )
             iteration += 1
 
-            lm_loss_tensor = loss_dict.get('lm loss', None)
-            if lm_loss_tensor is not None and torch.is_tensor(lm_loss_tensor):
-                lm_loss = lm_loss_tensor.item()
-            else:
-                lm_loss = 0.0
+            # Gather loss from last PP rank — without this, rank 0 sees 0.0
+            # whenever PP>1 because train_step only returns 'lm loss' on the
+            # final pipeline stage.
+            lm_loss = get_loss_for_logging(loss_dict)
             losses_this_phase.append(lm_loss)
 
             if rank == 0 and iteration % log_interval == 0:
@@ -413,21 +450,22 @@ def main():
                 gn = grad_norm if grad_norm is not None else 0.0
                 skip = " [SKIPPED]" if skipped_iter else ""
                 print(f"    iter {iteration:>6}/{phase['end_step']} | "
-                      f"loss: {avg_recent:.4f} | grad_norm: {gn:.4f}{skip}")
+                      f"loss: {avg_recent:.4f} | grad_norm: {gn:.4f}{skip}",
+                      flush=True)
 
         t_train = time.perf_counter() - t_train_start
         avg_iter_ms = (t_train / max(num_steps, 1)) * 1000
 
+        final_loss = losses_this_phase[-1] if losses_this_phase else None
         if rank == 0:
-            final_loss = losses_this_phase[-1] if losses_this_phase else None
             print(f"\n  [train] Done. {num_steps} steps in {t_train:.1f}s "
                   f"({avg_iter_ms:.0f}ms/iter)")
             if final_loss:
-                print(f"  [train] Final loss: {final_loss:.4f}")
+                print(f"  [train] Final loss: {final_loss:.4f}", flush=True)
 
         # ── 4d. Save checkpoint ───────────────────────────────────
         if rank == 0:
-            print(f"  [ckpt] Saving checkpoint at iteration {iteration}...")
+            print(f"  [ckpt] Saving checkpoint at iteration {iteration}...", flush=True)
         t0 = time.perf_counter()
 
         args.save = ckpt_dir
@@ -435,7 +473,7 @@ def main():
 
         t_save = time.perf_counter() - t0
         if rank == 0:
-            print(f"  [ckpt] Saved in {t_save:.2f}s")
+            print(f"  [ckpt] Saved in {t_save:.2f}s", flush=True)
 
         # ── 4e. Record and print phase results ───────────────────
         result = {
@@ -447,7 +485,7 @@ def main():
             "train_s": round(t_train, 2),
             "save_s": round(t_save, 2),
             "avg_iter_ms": round(avg_iter_ms, 1),
-            "final_loss": round(final_loss, 6) if final_loss else None,
+            "final_loss": round(final_loss, 6) if final_loss is not None else None,
             "num_steps": num_steps,
         }
         phase_results.append(result)
@@ -455,7 +493,7 @@ def main():
         # ── 4f. Cleanup for next phase ────────────────────────────
         if phase_idx < len(schedule) - 1:
             if rank == 0:
-                print(f"  [cleanup] Freeing model memory for next phase...")
+                print(f"  [cleanup] Freeing model memory for next phase...", flush=True)
             free_model_memory(model, optimizer, opt_param_scheduler)
         else:
             del model, optimizer, opt_param_scheduler
@@ -501,7 +539,7 @@ def main():
                 'phases': phase_results,
             }, f, indent=2)
         print(f"\n  Results: {results_file}")
-        print(f"{'=' * 70}\n")
+        print(f"{'=' * 70}\n", flush=True)
 
     # ── 6. Clean shutdown ─────────────────────────────────────────
     dist.barrier()
