@@ -24,7 +24,8 @@ Schedule JSON format:
 
 Reconfiguration sequence between phases:
     save checkpoint -> free GPU memory -> destroy NCCL groups ->
-    reinitialize parallel state -> rebuild model/optimizer -> load+reshard checkpoint
+    reinitialize parallel state -> RECONFIGURE microbatch calculator ->
+    rebuild model/optimizer -> load+reshard checkpoint
 """
 
 import argparse
@@ -74,6 +75,29 @@ def load_and_validate_schedule(path, n_gpus, num_layers, num_attention_heads):
             f"Gap between phase {phases[i-1]['phase']} and {phases[i]['phase']}"
 
     return phases
+
+
+def schedule_needs_reshard(path):
+    """
+    Return True if any phase boundary in the schedule changes (TP, PP).
+
+    Used to decide whether to request a fully-reshardable optimizer checkpoint.
+    Reshardable saves require an allgather of the full optimizer state onto
+    each rank, which can OOM on tight-memory configs (e.g. LLaMA-3B on DP=4
+    with only 46 GB/GPU — the 10+ GB allgather temp buffer on top of training
+    state exceeds the ceiling). We only pay that cost when an actual reshard
+    is coming.
+
+    Note: this runs BEFORE initialize_megatron, so we parse the raw JSON
+    without any of the validation in load_and_validate_schedule.
+    """
+    with open(path) as f:
+        raw = json.load(f)
+    for i in range(1, len(raw)):
+        if raw[i].get('tp') != raw[i-1].get('tp') \
+                or raw[i].get('pp') != raw[i-1].get('pp'):
+            return True
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -145,6 +169,45 @@ def destroy_model_parallel_with_nccl_cleanup():
 
     if dist.get_rank() == 0:
         print(f"  [cleanup] Destroyed {destroyed} NCCL process groups")
+
+
+# ═══════════════════════════════════════════════════════════════
+# Microbatch calculator reset
+# ═══════════════════════════════════════════════════════════════
+
+def reconfigure_microbatches_for_phase(args, rank):
+    """
+    Refresh Megatron's num_microbatches_calculator singleton for the new phase.
+
+    CRITICAL: without this call, phase 2 keeps phase 1's num_microbatches value
+    because the calculator is a process-wide singleton initialized at first
+    Megatron startup. When switching from e.g. DP=4,PP=1 (num_mb=2) to
+    DP=1,PP=4 (num_mb=8), the stale value of 2 causes the pipeline to run with
+    only 2 microbatches flowing through 4 stages — leaving GPUs idle in the
+    pipeline bubble and producing silently-faster-but-less-work iterations.
+
+    reconfigure_num_microbatches_calculator is the same helper Megatron uses
+    internally for rampup schedules; it rebuilds the singleton in-place
+    without disturbing the rest of the framework.
+    """
+    from megatron.core import num_microbatches_calculator as mbc
+    from megatron.core import parallel_state as mpu
+
+    dp_world = mpu.get_data_parallel_world_size()
+    mbc.reconfigure_num_microbatches_calculator(
+        rank=rank,
+        rampup_batch_size=args.rampup_batch_size,
+        global_batch_size=args.global_batch_size,
+        micro_batch_size=args.micro_batch_size,
+        data_parallel_size=dp_world,
+    )
+
+    if rank == 0:
+        print(f"  [reconfig] microbatch calculator -> "
+              f"num_microbatches = {mbc.get_num_microbatches()} "
+              f"(global={args.global_batch_size}, micro={args.micro_batch_size}, "
+              f"dp={dp_world})",
+              flush=True)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -246,6 +309,94 @@ def get_loss_for_logging(loss_dict):
 
 
 # ═══════════════════════════════════════════════════════════════
+# Parallel-state verification diagnostic
+# ═══════════════════════════════════════════════════════════════
+
+def verify_parallel_state(model, expected_tp, expected_pp, expected_dp, rank):
+    """
+    Print what Megatron ACTUALLY built vs what the schedule asked for.
+    """
+    from megatron.core import parallel_state as mpu
+    from megatron.core import num_microbatches_calculator as mbc
+
+    actual_tp = mpu.get_tensor_model_parallel_world_size()
+    actual_pp = mpu.get_pipeline_model_parallel_world_size()
+    actual_dp = mpu.get_data_parallel_world_size()
+    actual_num_mb = mbc.get_num_microbatches()
+
+    def count_decoder_layers(m):
+        inner = m
+        for attr in ('module', 'module'):
+            if hasattr(inner, attr):
+                inner = getattr(inner, attr)
+            else:
+                break
+        layers = getattr(getattr(inner, 'decoder', None), 'layers', None)
+        if layers is None:
+            return -1
+        try:
+            return len(layers)
+        except TypeError:
+            return sum(1 for _ in layers)
+
+    models = model if isinstance(model, list) else [model]
+    layers_per_chunk = [count_decoder_layers(m) for m in models]
+    total_local_layers = sum(l for l in layers_per_chunk if l >= 0)
+
+    total_params = 0
+    for m in models:
+        total_params += sum(p.numel() for p in m.parameters() if p.requires_grad)
+
+    my_info = torch.tensor(
+        [rank, actual_tp, actual_pp, actual_dp, total_local_layers, total_params // 1_000_000],
+        device=torch.cuda.current_device(), dtype=torch.long,
+    )
+    world_size = dist.get_world_size()
+    gathered = [torch.zeros_like(my_info) for _ in range(world_size)]
+    dist.all_gather(gathered, my_info)
+
+    if rank == 0:
+        ok_tp = (actual_tp == expected_tp)
+        ok_pp = (actual_pp == expected_pp)
+        ok_dp = (actual_dp == expected_dp)
+        tag_tp = "✓" if ok_tp else "✗"
+        tag_pp = "✓" if ok_pp else "✗"
+        tag_dp = "✓" if ok_dp else "✗"
+
+        print(f"  [verify] Parallel sizes  "
+              f"TP: {actual_tp}{tag_tp}(want {expected_tp})  "
+              f"PP: {actual_pp}{tag_pp}(want {expected_pp})  "
+              f"DP: {actual_dp}{tag_dp}(want {expected_dp})  "
+              f"|  num_microbatches = {actual_num_mb}",
+              flush=True)
+
+        print(f"  [verify] Per-rank layer & param counts:")
+        for g in gathered:
+            r, tp_, pp_, dp_, nlayers, nparams_m = [x.item() for x in g]
+            print(f"  [verify]   rank {r}: {nlayers:>3} decoder layers, "
+                  f"~{nparams_m}M params", flush=True)
+
+        from megatron.training import get_args
+        args = get_args()
+        expected_per_rank = args.num_layers // actual_pp
+        any_rank_full = any(g[4].item() == args.num_layers for g in gathered) \
+                        and actual_pp > 1
+        if any_rank_full:
+            print(f"  [verify] ⚠ WARNING: PP={actual_pp} but some rank holds all "
+                  f"{args.num_layers} layers. Reshard may not have applied!",
+                  flush=True)
+
+        expected_num_mb = args.global_batch_size // (args.micro_batch_size * actual_dp)
+        if actual_num_mb != expected_num_mb:
+            print(f"  [verify] ⚠ WARNING: num_microbatches = {actual_num_mb} "
+                  f"but expected {expected_num_mb} for "
+                  f"global={args.global_batch_size} / "
+                  f"(micro={args.micro_batch_size} × dp={actual_dp}). "
+                  f"Microbatch calculator may be stale!",
+                  flush=True)
+
+
+# ═══════════════════════════════════════════════════════════════
 # Args Helpers
 # ═══════════════════════════════════════════════════════════════
 
@@ -294,16 +445,38 @@ def main():
 
     ckpt_dir = os.path.join(elastic_args.elastic_work_dir, 'elastic_ckpt')
 
-    # Inject checkpoint args into Megatron argv
+    # Only request fully-reshardable optimizer checkpoints when the schedule
+    # actually changes (TP, PP) between phases. Reshardable saves require an
+    # allgather of the full optimizer state onto each rank (~10 GB for
+    # LLaMA-3B), which can OOM on tight-memory configs (e.g. DP=4 on 46 GB
+    # L40 with a large model, where training state alone is ~36 GB). We only
+    # pay that cost when we're actually going to reshard.
+    #
+    # torchrun exports RANK; use it here because dist isn't initialized yet.
+    _launch_rank = int(os.environ.get("RANK", "0"))
+    needs_reshard = schedule_needs_reshard(elastic_args.elastic_schedule)
+
     extra_megatron = [
         '--ckpt-format', 'torch_dist',
         '--use-distributed-optimizer',
-        '--dist-ckpt-optim-fully-reshardable',
         '--auto-detect-ckpt-format',
         '--override-opt_param-scheduler',
         '--save', ckpt_dir,
         '--save-interval', '999999',
     ]
+    if needs_reshard:
+        extra_megatron.append('--dist-ckpt-optim-fully-reshardable')
+        if _launch_rank == 0:
+            print("[elastic] schedule has reshards between phases; "
+                  "using fully-reshardable optimizer checkpoints",
+                  flush=True)
+    else:
+        if _launch_rank == 0:
+            print("[elastic] schedule is single-config (no reshards); "
+                  "using standard optimizer checkpoints "
+                  "(~10 GB saved during checkpoint save)",
+                  flush=True)
+
     sys.argv = [sys.argv[0]] + megatron_argv + extra_megatron
 
     # ── 2. Initialize Megatron (one-time cost) ────────────────────
@@ -347,6 +520,7 @@ def main():
         print(f"  Total steps:    {schedule[0]['start_step']} -> {schedule[-1]['end_step']}")
         print(f"  Megatron init:  {t_init:.1f}s (one-time cost)")
         print(f"  Checkpoint dir: {ckpt_dir}")
+        print(f"  Reshardable:    {needs_reshard}")
         print()
         for p in schedule:
             print(f"  Phase {p['phase']}: steps {p['start_step']:>5}->{p['end_step']:<5} "
@@ -394,6 +568,11 @@ def main():
             if rank == 0:
                 print(f"  [reconfig] initialize_model_parallel: {time.perf_counter()-t0:.2f}s",
                       flush=True)
+
+            # CRITICAL: refresh the microbatch calculator for the new DP size.
+            # Without this, phase 2 keeps phase 1's num_microbatches and
+            # silently under-fills the pipeline.
+            reconfigure_microbatches_for_phase(args, rank)
         else:
             update_args_for_phase(args, phase, ckpt_dir, is_first)
 
@@ -415,9 +594,12 @@ def main():
             alloc = torch.cuda.memory_allocated() / 1e9
             print(f"  [build] GPU memory allocated: {alloc:.2f}GB", flush=True)
 
+        # Verify the parallel state + microbatch count actually match the schedule
+        verify_parallel_state(model, expected_tp=tp, expected_pp=pp,
+                              expected_dp=dp, rank=rank)
+
         t_reconfig = time.perf_counter() - t_reconfig_start
 
-        # Get the correct pipeline schedule for this PP configuration
         forward_backward_func = get_forward_backward_func()
 
         # ── 4c. Training loop ─────────────────────────────────────
@@ -428,6 +610,7 @@ def main():
                   f"(iter {iteration}->{phase['end_step']})...", flush=True)
 
         t_train_start = time.perf_counter()
+        t_log_window = t_train_start
         losses_this_phase = []
         log_interval = args.log_interval
 
@@ -438,19 +621,21 @@ def main():
             )
             iteration += 1
 
-            # Gather loss from last PP rank — without this, rank 0 sees 0.0
-            # whenever PP>1 because train_step only returns 'lm loss' on the
-            # final pipeline stage.
             lm_loss = get_loss_for_logging(loss_dict)
             losses_this_phase.append(lm_loss)
 
             if rank == 0 and iteration % log_interval == 0:
+                t_now = time.perf_counter()
+                iter_ms = (t_now - t_log_window) * 1000.0 / log_interval
+                t_log_window = t_now
+
                 avg_recent = sum(losses_this_phase[-log_interval:]) / \
                              min(log_interval, len(losses_this_phase))
                 gn = grad_norm if grad_norm is not None else 0.0
                 skip = " [SKIPPED]" if skipped_iter else ""
                 print(f"    iter {iteration:>6}/{phase['end_step']} | "
-                      f"loss: {avg_recent:.4f} | grad_norm: {gn:.4f}{skip}",
+                      f"loss: {avg_recent:.4f} | grad_norm: {gn:.4f} | "
+                      f"{iter_ms:5.0f}ms/it{skip}",
                       flush=True)
 
         t_train = time.perf_counter() - t_train_start
@@ -464,18 +649,34 @@ def main():
                 print(f"  [train] Final loss: {final_loss:.4f}", flush=True)
 
         # ── 4d. Save checkpoint ───────────────────────────────────
-        if rank == 0:
-            print(f"  [ckpt] Saving checkpoint at iteration {iteration}...", flush=True)
-        t0 = time.perf_counter()
+        # Skip the save entirely if we don't need to reshard AND this is the
+        # last phase. Saves ~20s + ~10 GB of VRAM headroom. We still save
+        # between phases that reshard, because the next phase has to load.
+        is_last_phase = (phase_idx == len(schedule) - 1)
+        # Skip the final save unconditionally. By definition, no subsequent phase
+        # will load it, so the reshardable allgather burns memory for nothing —
+        # and for tight-memory configs (e.g. DP=4 on LLaMA-3B) that allgather
+        # can OOM. Mid-schedule saves still happen (the reshard depends on them).
+        skip_save = is_last_phase
 
-        args.save = ckpt_dir
-        save_checkpoint(iteration, model, optimizer, opt_param_scheduler, 0)
+        if skip_save:
+            if rank == 0:
+                print(f"  [ckpt] Skipping final checkpoint "
+                      f"(single-config run, no reshard needed)", flush=True)
+            t_save = 0.0
+        else:
+            if rank == 0:
+                print(f"  [ckpt] Saving checkpoint at iteration {iteration}...",
+                      flush=True)
+            t0 = time.perf_counter()
 
-        t_save = time.perf_counter() - t0
-        if rank == 0:
-            print(f"  [ckpt] Saved in {t_save:.2f}s", flush=True)
+            args.save = ckpt_dir
+            save_checkpoint(iteration, model, optimizer, opt_param_scheduler, 0)
 
-        # ── 4e. Record and print phase results ───────────────────
+            t_save = time.perf_counter() - t0
+            if rank == 0:
+                print(f"  [ckpt] Saved in {t_save:.2f}s", flush=True)
+
         result = {
             "phase": phase['phase'],
             "dp": dp, "tp": tp, "pp": pp,
@@ -490,7 +691,6 @@ def main():
         }
         phase_results.append(result)
 
-        # ── 4f. Cleanup for next phase ────────────────────────────
         if phase_idx < len(schedule) - 1:
             if rank == 0:
                 print(f"  [cleanup] Freeing model memory for next phase...", flush=True)
@@ -526,7 +726,6 @@ def main():
             print(f"  {r['phase']:<6} {config_str:<22} {r['reconfig_s']:>8.1f}s "
                   f"{r['train_s']:>7.1f}s {r['avg_iter_ms']:>7.0f}ms/it {loss_str:>10}")
 
-        # Write results JSON
         results_file = os.path.join(elastic_args.elastic_work_dir, 'elastic_results.json')
         os.makedirs(elastic_args.elastic_work_dir, exist_ok=True)
         with open(results_file, 'w') as f:
@@ -541,7 +740,6 @@ def main():
         print(f"\n  Results: {results_file}")
         print(f"{'=' * 70}\n", flush=True)
 
-    # ── 6. Clean shutdown ─────────────────────────────────────────
     dist.barrier()
 
 
