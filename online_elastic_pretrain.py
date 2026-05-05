@@ -7,22 +7,6 @@ online_elastic_pretrain.py
 --------------------------
 Online (greedy carbon-aware) sibling of elastic_pretrain.py.
 
-Instead of consuming a fixed schedule JSON, this entry point queries a
-GreedyScheduler at runtime to decide which (TP, PP) strategy to run next.
-The schedule emerges from a sequence of decisions taken every
-decide_every training steps, using:
-  - a live NVML measurement of cluster power and the observed step time,
-  - the carbon-intensity forecast supplied to the scheduler.
-
-Single-node assumption: each rank samples its local GPU via NVML
-(LOCAL_RANK == device index), and we all-reduce SUM across WORLD to get
-cluster-total power.
-
-Reuses the heavy-lifting helpers from elastic_pretrain.py unchanged
-(NCCL group cleanup, microbatch reconfiguration, model/loss/forward
-plumbing, parallel-state verifier, mock data, free_model_memory). Only
-the outer phase-driving loop is rewritten.
-
 Inputs (both required):
   --scheduler-config <path.json>   Strategies + scheduler scalars
   --carbon-forecast  <path.csv>    Hourly CI forecast (gCO2/kWh)
@@ -33,22 +17,13 @@ Inputs (both required):
         {"tp": int, "pp": int, "power_w": float, "step_time_s": float},
         ...
       ],
-      "switch_time_s":   float,
-      "switch_power_w":  float,
-      "deadline_s":      float,
-      "lookahead_steps": int,
-      "decide_every":    int
+      "switch_time_s":              float,
+      "switch_power_w":             float,
+      "deadline_s":                 float,
+      "lookahead_steps":            int,
+      "decide_every":               int,
+      "seconds_per_forecast_bucket": float   (optional, default 3600.0)
     }
-
-  carbon-forecast CSV (matches the synthetic generator):
-    columns: year, month, day, time, carbon
-    The 'carbon' column is read in row order; row 0 is treated as
-    wall-time t=0 (training start). Trim or shift the CSV upstream
-    if you want a different anchor.
-
-Outputs in --elastic-work-dir:
-  phases.json            — per-phase log of what was actually executed
-  elastic_results.json   — summary, same shape as elastic_pretrain.py
 """
 
 import argparse
@@ -65,13 +40,9 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.distributed as dist
 
-# Local Megatron-LM modules (same dir as this file).
 from gpt_builders import gpt_builder
 from model_provider import model_provider
 
-# Stable helpers from the original elastic_pretrain.py — reused as-is to
-# avoid duplicating the careful work already done there. If those helpers
-# move, update this import.
 from elastic_pretrain import (
     destroy_model_parallel_with_nccl_cleanup,
     reconfigure_microbatches_for_phase,
@@ -84,8 +55,6 @@ from elastic_pretrain import (
     free_model_memory,
 )
 
-# Online scheduler. greedy_scheduler.py must be importable — easiest is
-# to drop it next to this file in the Megatron-LM directory.
 from greedy_scheduler import GreedyScheduler, Strategy
 
 
@@ -94,20 +63,7 @@ from greedy_scheduler import GreedyScheduler, Strategy
 # ═══════════════════════════════════════════════════════════════
 
 def load_scheduler_config(path: str) -> Dict[str, Any]:
-    """Load and validate the scheduler JSON config.
-
-    Returns a dict with parsed/typed values:
-      strategies      : List[Strategy]
-      switch_time_s   : float
-      switch_power_w  : float
-      deadline_s      : float
-      lookahead_steps : int
-      decide_every    : int
-
-    Fails loudly on missing fields or wrong types — there's no sensible
-    default for things like the deadline, so we'd rather hard-exit than
-    train against silent fallbacks.
-    """
+    """Load and validate the scheduler JSON config."""
     with open(path) as f:
         raw = json.load(f)
 
@@ -135,30 +91,23 @@ def load_scheduler_config(path: str) -> Dict[str, Any]:
             step_time_s=float(s['step_time_s']),
         ))
 
-    # Defensive: reject duplicate (tp, pp) entries — the scheduler
-    # indexes operating points by key, so duplicates would silently
-    # collapse and the user wouldn't see all candidates listed.
     keys = [s.key for s in strategies]
     if len(set(keys)) != len(keys):
         raise ValueError(f"{path}: duplicate (tp, pp) entries in 'strategies'")
 
     return {
-        'strategies':      strategies,
-        'switch_time_s':   float(raw['switch_time_s']),
-        'switch_power_w':  float(raw['switch_power_w']),
-        'deadline_s':      float(raw['deadline_s']),
-        'lookahead_steps': int(raw['lookahead_steps']),
-        'decide_every':    int(raw['decide_every']),
+        'strategies':                  strategies,
+        'switch_time_s':               float(raw['switch_time_s']),
+        'switch_power_w':              float(raw['switch_power_w']),
+        'deadline_s':                  float(raw['deadline_s']),
+        'lookahead_steps':             int(raw['lookahead_steps']),
+        'decide_every':                int(raw['decide_every']),
+        'seconds_per_forecast_bucket': float(raw.get('seconds_per_forecast_bucket', 3600.0)),
     }
 
 
 def load_carbon_forecast(path: str) -> List[float]:
-    """Load hourly CI forecast from the synthetic-generator CSV format.
-
-    Expected columns: year, month, day, time, carbon  (extras ignored).
-    Returns the 'carbon' column as a list of floats in row order. The
-    timestamp columns are not used here — row 0 is t=0 by convention.
-    """
+    """Load hourly CI forecast from the synthetic-generator CSV format."""
     values: List[float] = []
     with open(path, newline='') as f:
         reader = csv.DictReader(f)
@@ -185,17 +134,7 @@ def load_carbon_forecast(path: str) -> List[float]:
 # ═══════════════════════════════════════════════════════════════
 
 class NvmlPowerSampler:
-    """Background thread that polls NVML for the local GPU's power.
-
-    Each rank samples the device given by LOCAL_RANK. consume_mean()
-    returns the mean since the last call and clears the buffer, so a
-    decision-boundary read naturally aggregates the *just-finished*
-    measurement window.
-
-    Thread safety: a single threading.Lock guards the sample buffer.
-    Sample reads are atomic floats so contention is negligible at
-    sub-Hz sampling rates.
-    """
+    """Background thread that polls NVML for the local GPU's power."""
 
     def __init__(self, gpu_index: int, sample_interval_s: float = 0.5):
         try:
@@ -228,19 +167,14 @@ class NvmlPowerSampler:
         pynvml = self._pynvml
         while not self._stop.is_set():
             try:
-                # NVML returns power in milliwatts.
                 p_w = pynvml.nvmlDeviceGetPowerUsage(self._handle) / 1000.0
                 with self._lock:
                     self._samples.append(p_w)
             except pynvml.NVMLError:
-                # Transient driver hiccup — drop this sample, keep going.
                 pass
             self._stop.wait(self.sample_interval_s)
 
     def consume_mean(self) -> float:
-        """Mean power since the last call, in watts. Empties the buffer.
-        Returns 0.0 if no samples have been collected (e.g., very short
-        window) — caller should treat 0.0 as "no measurement"."""
         with self._lock:
             samples = self._samples
             self._samples = []
@@ -258,15 +192,7 @@ class NvmlPowerSampler:
 
 
 def sample_cluster_power(sampler: NvmlPowerSampler) -> float:
-    """All-reduce per-rank mean power across WORLD to get cluster total.
-
-    On single-node multi-GPU setups, this is the cluster wattage during
-    the just-finished window. If a rank produced no samples (e.g.,
-    sub-sample-interval window), it contributes 0 W — the sum is still
-    a valid lower bound but slightly under-counts. With decide_every=50
-    and seconds-per-step >= 1s, every rank gets >= 50 samples per
-    window, so this is not a practical concern.
-    """
+    """All-reduce per-rank mean power across WORLD to get cluster total."""
     local_mean = sampler.consume_mean()
     t = torch.tensor([local_mean], device=torch.cuda.current_device(),
                      dtype=torch.float32)
@@ -275,18 +201,14 @@ def sample_cluster_power(sampler: NvmlPowerSampler) -> float:
 
 
 # ═══════════════════════════════════════════════════════════════
-# Strategy validation (replaces load_and_validate_schedule)
+# Strategy validation
 # ═══════════════════════════════════════════════════════════════
 
 def validate_strategies_or_die(strategies: List[Strategy], n_gpus: int,
                                num_layers: int, num_attention_heads: int,
                                num_query_groups: Optional[int],
                                rank: int) -> None:
-    """Run all the divisibility checks that load_and_validate_schedule
-    would have run, but applied to *every* strategy the scheduler might
-    pick — since with online scheduling we don't know the schedule ahead
-    of time. Any infeasible strategy is a hard exit; we'd rather fail
-    loudly upfront than mid-run after a reshard."""
+    """Run divisibility checks against every strategy in the menu."""
     failures = []
     for s in strategies:
         errs = []
@@ -319,7 +241,6 @@ def validate_strategies_or_die(strategies: List[Strategy], n_gpus: int,
 
 def update_args_for_strategy(args, strategy: Strategy, ckpt_dir: str,
                              is_first_phase: bool) -> None:
-    """Strategy-keyed counterpart to elastic_pretrain.update_args_for_phase."""
     args.tensor_model_parallel_size = strategy.tp
     args.pipeline_model_parallel_size = strategy.pp
     args.save = ckpt_dir
@@ -351,11 +272,6 @@ def main():
 
     ckpt_dir = os.path.join(elastic_args.elastic_work_dir, 'elastic_ckpt')
 
-    # Online scheduling assumes any (tp, pp) in strategies is reachable,
-    # so we always need fully-reshardable optimizer checkpoints. That
-    # forces the same ~10 GB allgather cost that the offline path only
-    # paid for actually-reshardable schedules; keep that in mind when
-    # choosing model size vs. GPU memory budget.
     extra_megatron = [
         '--ckpt-format', 'torch_dist',
         '--use-distributed-optimizer',
@@ -371,12 +287,13 @@ def main():
     cfg = load_scheduler_config(elastic_args.scheduler_config)
     ci_hourly = load_carbon_forecast(elastic_args.carbon_forecast)
 
-    strategies      = cfg['strategies']
-    switch_time_s   = cfg['switch_time_s']
-    switch_power_w  = cfg['switch_power_w']
-    deadline_s      = cfg['deadline_s']
-    lookahead_steps = cfg['lookahead_steps']
-    decide_every    = cfg['decide_every']
+    strategies                  = cfg['strategies']
+    switch_time_s               = cfg['switch_time_s']
+    switch_power_w              = cfg['switch_power_w']
+    deadline_s                  = cfg['deadline_s']
+    lookahead_steps             = cfg['lookahead_steps']
+    decide_every                = cfg['decide_every']
+    seconds_per_forecast_bucket = cfg['seconds_per_forecast_bucket']
 
     # ── 3. Initialize Megatron (one-time cost) ──────────────────
     from megatron.training.initialize import initialize_megatron
@@ -402,10 +319,15 @@ def main():
     total_steps = args.train_iters
 
     # ── 4. Validate every strategy upfront ──────────────────────
+    # Only validate num_query_groups % tp when GQA is actually enabled.
+    # Megatron sets args.num_query_groups=1 by default whether or not GQA
+    # is on, so checking for None isn't enough — gate on the flag instead.
+    gqa_enabled = getattr(args, 'group_query_attention', False)
+    num_query_groups = args.num_query_groups if gqa_enabled else None
     validate_strategies_or_die(
         strategies, n_gpus,
         args.num_layers, args.num_attention_heads,
-        getattr(args, 'num_query_groups', None),
+        num_query_groups,
         rank,
     )
 
@@ -435,6 +357,7 @@ def main():
         ci_forecast_hourly_gco2_per_kwh=ci_hourly,
         lookahead_steps=lookahead_steps,
         initial_strategy_idx=initial_idx,
+        seconds_per_forecast_bucket=seconds_per_forecast_bucket,
     )
 
     # ── 7. Start NVML power sampler (per-rank, local device) ────
@@ -445,18 +368,20 @@ def main():
         print("\n" + "=" * 70)
         print("  ONLINE ELASTIC 3D PARALLELISM (greedy carbon-aware)")
         print("=" * 70)
-        print(f"  GPUs:             {n_gpus}")
-        print(f"  Total steps:      {total_steps}")
-        print(f"  Deadline:         {deadline_s/3600:.2f} h")
-        print(f"  Decide every:     {decide_every} steps")
-        print(f"  Lookahead:        {lookahead_steps} steps")
-        print(f"  Switch cost:      {switch_time_s}s @ {switch_power_w}W")
-        print(f"  Megatron init:    {t_init:.1f}s (one-time cost)")
-        print(f"  Checkpoint dir:   {ckpt_dir}")
-        print(f"  Scheduler config: {elastic_args.scheduler_config}")
-        print(f"  Carbon forecast:  {elastic_args.carbon_forecast} "
-              f"({len(ci_hourly)} hourly buckets)")
-        print(f"  Strategy menu:    {len(strategies)} candidates")
+        print(f"  GPUs:              {n_gpus}")
+        print(f"  Total steps:       {total_steps}")
+        print(f"  Deadline:          {deadline_s/3600:.2f} h ({deadline_s:.0f}s)")
+        print(f"  Decide every:      {decide_every} steps")
+        print(f"  Lookahead:         {lookahead_steps} steps")
+        print(f"  Switch cost:       {switch_time_s}s @ {switch_power_w}W")
+        print(f"  Bucket size:       {seconds_per_forecast_bucket}s "
+              f"(forecast row → wall-time mapping)")
+        print(f"  Megatron init:     {t_init:.1f}s (one-time cost)")
+        print(f"  Checkpoint dir:    {ckpt_dir}")
+        print(f"  Scheduler config:  {elastic_args.scheduler_config}")
+        print(f"  Carbon forecast:   {elastic_args.carbon_forecast} "
+              f"({len(ci_hourly)} buckets)")
+        print(f"  Strategy menu:     {len(strategies)} candidates")
         for s in strategies:
             tag = "← initial" if s is strategies[initial_idx] else ""
             print(f"    TP={s.tp} PP={s.pp}  P≈{s.power_w}W  τ≈{s.step_time_s}s  {tag}")
@@ -465,7 +390,7 @@ def main():
     # ── 8. Drive phases until we reach total_steps ──────────────
     iteration = 0
     current = sched.current
-    pending_strategy: Optional[Strategy] = None  # set by inner loop on switch
+    pending_strategy: Optional[Strategy] = None
     phase_num = 0
     phase_results: List[dict] = []
     data_iter = RerunDataIterator(iter(infinite_data_iterator()))
@@ -485,7 +410,6 @@ def main():
                       f"(DP={dp}, TP={current.tp}, PP={current.pp})")
                 print(f"{'=' * 70}", flush=True)
 
-            # ── 8a. Reconfig (skipped on first phase) ───────────
             if not is_first:
                 if rank == 0:
                     print("  [reconfig] Destroying old parallel state...",
@@ -517,7 +441,6 @@ def main():
                 update_args_for_strategy(args, current, ckpt_dir,
                                          is_first_phase=True)
 
-            # ── 8b. Build model + optimizer ─────────────────────
             if rank == 0:
                 print("  [build] Constructing model and optimizer...",
                       flush=True)
@@ -527,7 +450,6 @@ def main():
             )
             t_build = time.perf_counter() - t0
 
-            # Megatron may advance args.iteration on checkpoint load.
             iteration = getattr(args, 'iteration', iteration)
             if rank == 0:
                 print(f"  [build] Model + optimizer + checkpoint: {t_build:.2f}s")
@@ -545,16 +467,11 @@ def main():
             )
 
             t_reconfig = time.perf_counter() - t_reconfig_start
-
-            # Flush the sampler's buffer — it accumulated samples during
-            # the (mostly idle) reconfig, which would skew the first
-            # window's mean if we read it now.
             power_sampler.consume_mean()
 
             forward_backward_func = get_forward_backward_func()
             config = core_transformer_config_from_args(args)
 
-            # ── 8c. Inner loop: train until decision says switch ────
             t_train_start = time.perf_counter()
             t_log_window = t_train_start
             losses_this_phase: List[float] = []
@@ -562,7 +479,7 @@ def main():
 
             window_start_t = time.perf_counter()
             window_start_step = iteration
-            phase_observations: List[tuple] = []  # (power_w, step_time_s)
+            phase_observations: List[tuple] = []
             pending_strategy = None
 
             if rank == 0:
@@ -593,7 +510,6 @@ def main():
                           f"loss: {avg_recent:.4f} | grad_norm: {gn:.4f} | "
                           f"{iter_ms:5.0f}ms/it{skip}", flush=True)
 
-                # Decision boundary?
                 steps_in_window = iteration - window_start_step
                 at_decision = (
                     steps_in_window >= decide_every
@@ -602,26 +518,78 @@ def main():
                 if not at_decision:
                     continue
 
-                # Observe what we just did. Both measurements are
-                # cluster-aggregate by construction (NVML sum across
-                # ranks; wall time is the same on every rank).
                 window_dur = time.perf_counter() - window_start_t
                 measured_step_time = window_dur / steps_in_window
                 measured_power = sample_cluster_power(power_sampler)
                 phase_observations.append((measured_power, measured_step_time))
+
+                # Capture the cached operating point before observe() runs the
+                # EMA, so we can show the refinement step-by-step in the log.
+                pre = sched._ops[current.key]
                 sched.observe(current.key, measured_power, measured_step_time)
+                post = sched._ops[current.key]
 
                 if rank == 0:
-                    print(f"    [observe] window {steps_in_window} steps:  "
-                          f"{measured_power:>6.1f}W cluster,  "
-                          f"{measured_step_time:.3f}s/step", flush=True)
+                    wall_time = time.perf_counter() - global_start
+                    ci_now = sched.ci_at(wall_time) * 3.6e6
+                    print(f"    [observe] {steps_in_window} steps  "
+                          f"meas: P={measured_power:.0f}W τ={measured_step_time:.3f}s  |  "
+                          f"EMA: P {pre.power_w:.0f}→{post.power_w:.0f}W "
+                          f"τ {pre.step_time_s:.3f}→{post.step_time_s:.3f}s  |  "
+                          f"CI≈{ci_now:.0f}", flush=True)
 
-                # Decide. Skip the decision if we've already finished —
-                # there's no next phase to schedule.
                 if iteration >= total_steps:
                     break
 
                 wall_time = time.perf_counter() - global_start
+
+                # Diagnostic: what does the scheduler think each strategy would
+                # cost? Iterate sched.strategies (EMA-updated) and use
+                # sched.current — both must match what decide() sees internally,
+                # otherwise the displayed ★ can disagree with the actual choice.
+                if rank == 0:
+                    H_eff = min(lookahead_steps, total_steps - iteration)
+                    remaining_steps_cur = total_steps - iteration
+                    remaining_time_cur = deadline_s - wall_time
+                    fastest_tau = min(s.step_time_s for s in sched.strategies)
+                    slack = remaining_time_cur - remaining_steps_cur * fastest_tau
+
+                    # Sample CI across the *current* strategy's lookahead window
+                    # so we can see whether temporal variation is visible to the
+                    # policy at this decision point. Use sched.current's τ for
+                    # the window length.
+                    cur = sched.current
+                    window_dur_la = H_eff * cur.step_time_s
+                    ci_samples = [sched.ci_at(wall_time + frac * window_dur_la) * 3.6e6
+                                  for frac in (0.0, 0.5, 1.0)]
+
+                    print(f"    [scheduler] H={H_eff}, t={wall_time:.1f}s, "
+                          f"CI in window: {ci_samples[0]:.0f}→{ci_samples[1]:.0f}→"
+                          f"{ci_samples[2]:.0f} gCO2/kWh, "
+                          f"slack={slack:.1f}s", flush=True)
+
+                    # Compute cost for each candidate using the SAME state
+                    # decide() will use: EMA-updated operating points
+                    # (sched.strategies) and the scheduler's internal current
+                    # (sched.current). This guarantees the displayed ★ matches
+                    # the action taken by decide() on the next line.
+                    costs = []
+                    for s in sched.strategies:
+                        cost = sched._lookahead_carbon(s, sched.current,
+                                                      wall_time, H_eff)
+                        feas = (s.step_time_s * remaining_steps_cur
+                                <= remaining_time_cur)
+                        costs.append((s, cost, feas))
+
+                    # Sort cheapest-first so the rank ordering jumps out at a glance.
+                    costs.sort(key=lambda x: x[1])
+                    for rank_idx, (s, cost, feas) in enumerate(costs):
+                        action = "(stay)  " if s.key == sched.current.key else "(switch)"
+                        feas_tag = "        " if feas else "[INFEAS]"
+                        marker = "★" if rank_idx == 0 else " "
+                        print(f"    [scheduler] {marker} TP={s.tp} PP={s.pp} {action} {feas_tag} "
+                              f"→ {cost*1000:.2f} mgCO2 over {H_eff} steps", flush=True)
+
                 next_strat = sched.decide(iteration, wall_time)
 
                 if next_strat.key != current.key:
@@ -630,7 +598,7 @@ def main():
                               f"TP={current.tp}/PP={current.pp} → "
                               f"TP={next_strat.tp}/PP={next_strat.pp} "
                               f"@ step {iteration} "
-                              f"(wall {wall_time/3600:.2f}h)", flush=True)
+                              f"(wall {wall_time:.1f}s)", flush=True)
                     pending_strategy = next_strat
                     break
 
@@ -638,7 +606,6 @@ def main():
                     print(f"    [decide] stay on "
                           f"TP={current.tp}/PP={current.pp}", flush=True)
 
-                # Reset the window.
                 window_start_t = time.perf_counter()
                 window_start_step = iteration
 
@@ -653,8 +620,7 @@ def main():
             else:
                 obs_p = obs_t = None
 
-            # ── 8d. Save checkpoint iff there's a next phase ────
-            is_last = (pending_strategy is None)  # we either hit total_steps or no switch
+            is_last = (pending_strategy is None)
             if is_last:
                 if rank == 0:
                     print(f"  [ckpt] Skipping final checkpoint "
@@ -706,7 +672,7 @@ def main():
     finally:
         power_sampler.stop()
 
-    # ── 9. Emit phases.json + summary results JSON ──────────────
+    # ── 9. Emit phases.json + summary ──────────────────────────
     if rank == 0:
         os.makedirs(elastic_args.elastic_work_dir, exist_ok=True)
 
@@ -761,6 +727,7 @@ def main():
                 'lookahead_steps': lookahead_steps,
                 'switch_time_s': switch_time_s,
                 'switch_power_w': switch_power_w,
+                'seconds_per_forecast_bucket': seconds_per_forecast_bucket,
                 'scheduler_config_path': elastic_args.scheduler_config,
                 'carbon_forecast_path': elastic_args.carbon_forecast,
                 'phases': phase_results,
