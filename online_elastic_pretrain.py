@@ -7,23 +7,37 @@ online_elastic_pretrain.py
 --------------------------
 Online (greedy carbon-aware) sibling of elastic_pretrain.py.
 
-Inputs (both required):
-  --scheduler-config <path.json>   Strategies + scheduler scalars
+Inputs (required):
+  --scheduler-config <path.json>   Calibration JSON from profile_strategies.py
+                                   (provides strategies + average_reshard_wall_time_s)
   --carbon-forecast  <path.csv>    Hourly CI forecast (gCO2/kWh)
 
-  scheduler_config.json schema:
-    {
-      "strategies": [
-        {"tp": int, "pp": int, "power_w": float, "step_time_s": float},
-        ...
-      ],
-      "switch_time_s":              float,
-      "switch_power_w":             float,
-      "deadline_s":                 float,
-      "lookahead_steps":            int,
-      "decide_every":               int,
-      "seconds_per_forecast_bucket": float   (optional, default 3600.0)
-    }
+Policy parameters (required, from CLI or JSON):
+  --switch-power-w     <float>     Power draw during reshard window (W)
+  --deadline-seconds   <float>     Total training deadline (s)
+  --lookahead-steps    <int>       Greedy lookahead horizon (steps)
+  --decide-every       <int>       Decision interval (steps)
+
+Optional overrides:
+  --switch-time-seconds <float>    Override JSON's average_reshard_wall_time_s
+  --bucket-seconds      <float>    Wall seconds per CI forecast row (default 3600)
+
+The scheduler-config JSON minimally needs:
+  {
+    "strategies": [
+      {"tp": int, "pp": int, "power_w": float, "step_time_s": float, ...},
+      ...
+    ],
+    "average_reshard_wall_time_s": float    (used as switch_time_s)
+  }
+
+Extra fields in the calibration (dp, warmup_iters, save_s, mpu_reshard_s,
+etc.) are ignored. Policy fields (switch_power_w, deadline_s,
+lookahead_steps, decide_every, seconds_per_forecast_bucket) MAY also be
+embedded in the JSON for convenience — CLI args take precedence when
+both are present. This separation lets the same calibration drive
+multiple comparison runs (greedy / fast-only / slow-only) by varying
+only the CLI flags.
 """
 
 import argparse
@@ -63,17 +77,21 @@ from greedy_scheduler import GreedyScheduler, Strategy
 # ═══════════════════════════════════════════════════════════════
 
 def load_scheduler_config(path: str) -> Dict[str, Any]:
-    """Load and validate the scheduler JSON config."""
+    """Load calibration/scheduler JSON.
+
+    Accepts the output of profile_strategies.py, which has:
+      - strategies: list of {tp, pp, power_w, step_time_s, ...}
+      - average_reshard_wall_time_s: used as switch_time_s if no CLI override
+
+    Policy fields (switch_power_w, deadline_s, lookahead_steps, decide_every,
+    seconds_per_forecast_bucket) MAY be embedded for convenience but are
+    optional here — main() merges them with CLI args. Returned values are
+    None when absent so the caller can detect missing fields.
+    """
     with open(path) as f:
         raw = json.load(f)
 
-    required_top = ['strategies', 'switch_time_s', 'switch_power_w',
-                    'deadline_s', 'lookahead_steps', 'decide_every']
-    missing = [k for k in required_top if k not in raw]
-    if missing:
-        raise ValueError(f"{path}: missing required keys {missing}")
-
-    raw_strats = raw['strategies']
+    raw_strats = raw.get('strategies')
     if not isinstance(raw_strats, list) or not raw_strats:
         raise ValueError(f"{path}: 'strategies' must be a non-empty list")
 
@@ -95,14 +113,28 @@ def load_scheduler_config(path: str) -> Dict[str, Any]:
     if len(set(keys)) != len(keys):
         raise ValueError(f"{path}: duplicate (tp, pp) entries in 'strategies'")
 
+    # switch_time_s: prefer 'average_reshard_wall_time_s' (output of the
+    # profiler), fall back to 'switch_time_s' for backwards compatibility
+    # with older hand-written scheduler configs.
+    switch_time_s = raw.get('average_reshard_wall_time_s',
+                            raw.get('switch_time_s'))
+
     return {
         'strategies':                  strategies,
-        'switch_time_s':               float(raw['switch_time_s']),
-        'switch_power_w':              float(raw['switch_power_w']),
-        'deadline_s':                  float(raw['deadline_s']),
-        'lookahead_steps':             int(raw['lookahead_steps']),
-        'decide_every':                int(raw['decide_every']),
-        'seconds_per_forecast_bucket': float(raw.get('seconds_per_forecast_bucket', 3600.0)),
+        # All scalar fields below may be None — main() resolves against CLI.
+        'switch_time_s':               (float(switch_time_s)
+                                        if switch_time_s is not None else None),
+        'switch_power_w':              (float(raw['switch_power_w'])
+                                        if 'switch_power_w' in raw else None),
+        'deadline_s':                  (float(raw['deadline_s'])
+                                        if 'deadline_s' in raw else None),
+        'lookahead_steps':             (int(raw['lookahead_steps'])
+                                        if 'lookahead_steps' in raw else None),
+        'decide_every':                (int(raw['decide_every'])
+                                        if 'decide_every' in raw else None),
+        'seconds_per_forecast_bucket': (float(raw['seconds_per_forecast_bucket'])
+                                        if 'seconds_per_forecast_bucket' in raw
+                                        else None),
     }
 
 
@@ -264,10 +296,33 @@ def main():
     elastic_parser.add_argument('--elastic-work-dir',
                                 default='/tmp/elastic_training')
     elastic_parser.add_argument('--scheduler-config', required=True,
-                                help='Path to JSON with strategies + scalars')
+                                help='Path to calibration JSON from '
+                                     'profile_strategies.py')
     elastic_parser.add_argument('--carbon-forecast', required=True,
                                 help='Path to CSV with hourly CI forecast '
                                      '(columns: year,month,day,time,carbon)')
+    # Policy parameters — required (CLI or JSON), CLI takes precedence.
+    elastic_parser.add_argument('--switch-power-w',     type=float, default=None,
+                                help='Power draw during reshard window (W). '
+                                     'Overrides JSON switch_power_w.')
+    elastic_parser.add_argument('--deadline-seconds',   type=float, default=None,
+                                help='Total training deadline (s). '
+                                     'Overrides JSON deadline_s.')
+    elastic_parser.add_argument('--lookahead-steps',    type=int,   default=None,
+                                help='Greedy lookahead horizon (steps). '
+                                     'Overrides JSON lookahead_steps.')
+    elastic_parser.add_argument('--decide-every',       type=int,   default=None,
+                                help='Decision interval (steps). '
+                                     'Overrides JSON decide_every.')
+    # Optional overrides — sensible defaults / derivable from JSON.
+    elastic_parser.add_argument('--switch-time-seconds', type=float, default=None,
+                                help='Override the calibration\'s '
+                                     'average_reshard_wall_time_s. Useful '
+                                     'for ablations.')
+    elastic_parser.add_argument('--bucket-seconds',     type=float, default=None,
+                                help='Wall seconds per CI forecast row '
+                                     '(default 3600). Overrides JSON '
+                                     'seconds_per_forecast_bucket.')
     elastic_args, megatron_argv = elastic_parser.parse_known_args()
 
     ckpt_dir = os.path.join(elastic_args.elastic_work_dir, 'elastic_ckpt')
@@ -287,13 +342,40 @@ def main():
     cfg = load_scheduler_config(elastic_args.scheduler_config)
     ci_hourly = load_carbon_forecast(elastic_args.carbon_forecast)
 
+    # Resolve policy params: CLI > JSON > built-in default. Required params
+    # error if absent from both sources.
+    def resolve(cli_val, json_val, cli_flag_name, default=None):
+        if cli_val is not None:
+            return cli_val
+        if json_val is not None:
+            return json_val
+        if default is not None:
+            return default
+        raise ValueError(
+            f"Required parameter must be provided via --{cli_flag_name} CLI "
+            f"arg or as a field in {elastic_args.scheduler_config}"
+        )
+
     strategies                  = cfg['strategies']
-    switch_time_s               = cfg['switch_time_s']
-    switch_power_w              = cfg['switch_power_w']
-    deadline_s                  = cfg['deadline_s']
-    lookahead_steps             = cfg['lookahead_steps']
-    decide_every                = cfg['decide_every']
-    seconds_per_forecast_bucket = cfg['seconds_per_forecast_bucket']
+    switch_time_s               = resolve(elastic_args.switch_time_seconds,
+                                          cfg['switch_time_s'],
+                                          'switch-time-seconds')
+    switch_power_w              = resolve(elastic_args.switch_power_w,
+                                          cfg['switch_power_w'],
+                                          'switch-power-w')
+    deadline_s                  = resolve(elastic_args.deadline_seconds,
+                                          cfg['deadline_s'],
+                                          'deadline-seconds')
+    lookahead_steps             = resolve(elastic_args.lookahead_steps,
+                                          cfg['lookahead_steps'],
+                                          'lookahead-steps')
+    decide_every                = resolve(elastic_args.decide_every,
+                                          cfg['decide_every'],
+                                          'decide-every')
+    seconds_per_forecast_bucket = resolve(elastic_args.bucket_seconds,
+                                          cfg['seconds_per_forecast_bucket'],
+                                          'bucket-seconds',
+                                          default=3600.0)
 
     # ── 3. Initialize Megatron (one-time cost) ──────────────────
     from megatron.training.initialize import initialize_megatron
