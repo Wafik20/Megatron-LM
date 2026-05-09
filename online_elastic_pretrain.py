@@ -38,6 +38,19 @@ embedded in the JSON for convenience — CLI args take precedence when
 both are present. This separation lets the same calibration drive
 multiple comparison runs (greedy / fast-only / slow-only) by varying
 only the CLI flags.
+
+Cross-rank determinism note
+---------------------------
+Each rank computes window_dur and wall_time using its OWN perf_counter,
+which drifts at the millisecond scale across ranks. That drift propagates
+into the EMA via measured_step_time and into ci_at() lookups via
+wall_time. At feasibility boundaries (slack ≈ 0) tiny float-level
+differences can flip decide()'s output between ranks — ranks 1+ then
+take the "switch → save_checkpoint" path while rank 0 takes the "stay →
+keep training" path, and the next collective deadlocks. To prevent this
+we broadcast (measured_step_time, wall_time) from rank 0 before they
+feed observe() and decide(), so every rank reaches the same decision
+deterministically.
 """
 
 import argparse
@@ -230,6 +243,19 @@ def sample_cluster_power(sampler: NvmlPowerSampler) -> float:
                      dtype=torch.float32)
     dist.all_reduce(t, op=dist.ReduceOp.SUM)
     return t.item()
+
+
+def sync_scalars_from_rank0(values: List[float]) -> List[float]:
+    """Broadcast a list of float scalars from rank 0 to all ranks. Used to
+    eliminate per-rank perf_counter drift that would otherwise propagate
+    into observe()/decide() and cause ranks to disagree on whether to
+    switch — the disagreement deadlocks NCCL on the next collective.
+    """
+    t = torch.tensor(values,
+                     device=torch.cuda.current_device(),
+                     dtype=torch.float64)
+    dist.broadcast(t, src=0)
+    return t.tolist()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -600,9 +626,24 @@ def main():
                 if not at_decision:
                     continue
 
+                # ── Compute decision-window measurements (rank-local) ──
                 window_dur = time.perf_counter() - window_start_t
                 measured_step_time = window_dur / steps_in_window
-                measured_power = sample_cluster_power(power_sampler)
+                measured_power = sample_cluster_power(power_sampler)  # already synced
+
+                # ── Synchronize rank-local scalars across ranks ────────
+                # Each rank's measured_step_time and wall_time come from its
+                # OWN perf_counter and drift across ranks. Without sync, the
+                # EMA inside observe() drifts per-rank, ci_at(wall_time)
+                # returns slightly different values, and decide() can flip
+                # between "stay" and "switch" at feasibility boundaries —
+                # half the ranks save a checkpoint, the other half keep
+                # training, NCCL deadlocks. Authoritative: rank 0.
+                local_wall_time = time.perf_counter() - global_start
+                measured_step_time, wall_time = sync_scalars_from_rank0(
+                    [measured_step_time, local_wall_time]
+                )
+
                 phase_observations.append((measured_power, measured_step_time))
 
                 # Capture the cached operating point before observe() runs the
@@ -612,7 +653,6 @@ def main():
                 post = sched._ops[current.key]
 
                 if rank == 0:
-                    wall_time = time.perf_counter() - global_start
                     ci_now = sched.ci_at(wall_time) * 3.6e6
                     print(f"    [observe] {steps_in_window} steps  "
                           f"meas: P={measured_power:.0f}W τ={measured_step_time:.3f}s  |  "
@@ -622,8 +662,6 @@ def main():
 
                 if iteration >= total_steps:
                     break
-
-                wall_time = time.perf_counter() - global_start
 
                 # Diagnostic: what does the scheduler think each strategy would
                 # cost? Iterate sched.strategies (EMA-updated) and use
@@ -672,6 +710,9 @@ def main():
                         print(f"    [scheduler] {marker} TP={s.tp} PP={s.pp} {action} {feas_tag} "
                               f"→ {cost*1000:.2f} mgCO2 over {H_eff} steps", flush=True)
 
+                # All ranks now see identical (measured_step_time, wall_time)
+                # → identical EMA state → identical decide() output. No
+                # further broadcast needed.
                 next_strat = sched.decide(iteration, wall_time)
 
                 if next_strat.key != current.key:
@@ -820,6 +861,30 @@ def main():
         print(f"{'=' * 70}\n", flush=True)
 
     dist.barrier()
+
+    # ── 10. Explicit shutdown ─────────────────────────────────
+    # Without these, PyTorch's atexit handler is responsible for NCCL
+    # cleanup, and after many destroy/init cycles it routinely hangs.
+    # All 4 GPUs sit idle at ~50W each, polluting the launcher's power
+    # log until SLURM kills the job. Tear it down ourselves on a clean
+    # path so the process exits as soon as training is done.
+    try:
+        destroy_model_parallel_with_nccl_cleanup()
+    except Exception as e:
+        if rank == 0:
+            print(f"[shutdown] destroy_model_parallel_with_nccl_cleanup "
+                  f"failed: {e}", flush=True)
+
+    try:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+    except Exception as e:
+        if rank == 0:
+            print(f"[shutdown] destroy_process_group failed: {e}",
+                  flush=True)
+
+    if rank == 0:
+        print("[shutdown] clean exit", flush=True)
 
 
 if __name__ == '__main__':

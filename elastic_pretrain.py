@@ -742,6 +742,5 @@ def main():
 
     dist.barrier()
 
-
 if __name__ == '__main__':
     main()
