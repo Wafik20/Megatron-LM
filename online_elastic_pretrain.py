@@ -21,6 +21,8 @@ Policy parameters (required, from CLI or JSON):
 Optional overrides:
   --switch-time-seconds <float>    Override JSON's average_reshard_wall_time_s
   --bucket-seconds      <float>    Wall seconds per CI forecast row (default 3600)
+                                   (greedy only; naive uses progress mapping)
+  --min-dwell-steps     <int>      Naive-only: CI smoothing window in steps
 
 The scheduler-config JSON minimally needs:
   {
@@ -33,10 +35,10 @@ The scheduler-config JSON minimally needs:
 
 Extra fields in the calibration (dp, warmup_iters, save_s, mpu_reshard_s,
 etc.) are ignored. Policy fields (switch_power_w, deadline_s,
-lookahead_steps, decide_every, seconds_per_forecast_bucket) MAY also be
-embedded in the JSON for convenience — CLI args take precedence when
-both are present. This separation lets the same calibration drive
-multiple comparison runs (greedy / fast-only / slow-only) by varying
+lookahead_steps, decide_every, seconds_per_forecast_bucket, min_dwell_steps)
+MAY also be embedded in the JSON for convenience — CLI args take
+precedence when both are present. This separation lets the same calibration
+drive multiple comparison runs (greedy / fast-only / slow-only) by varying
 only the CLI flags.
 
 Cross-rank determinism note
@@ -83,13 +85,17 @@ from elastic_pretrain import (
 )
 
 from greedy_scheduler import GreedyScheduler, Strategy
+from naive_scheduler import NaiveScheduler
 
 
 # ═══════════════════════════════════════════════════════════════
 # Config loading
 # ═══════════════════════════════════════════════════════════════
 
-def load_scheduler_config(path: str) -> Dict[str, Any]:
+def load_scheduler_config(
+    path: str,
+    allow_duplicate_strategy_keys: bool = False,
+) -> Dict[str, Any]:
     """Load calibration/scheduler JSON.
 
     Accepts the output of profile_strategies.py, which has:
@@ -97,9 +103,10 @@ def load_scheduler_config(path: str) -> Dict[str, Any]:
       - average_reshard_wall_time_s: used as switch_time_s if no CLI override
 
     Policy fields (switch_power_w, deadline_s, lookahead_steps, decide_every,
-    seconds_per_forecast_bucket) MAY be embedded for convenience but are
-    optional here — main() merges them with CLI args. Returned values are
-    None when absent so the caller can detect missing fields.
+    seconds_per_forecast_bucket, min_dwell_steps) MAY be embedded for
+    convenience but are optional here — main() merges them with CLI args.
+    Returned values are None when absent so the caller can detect missing
+    fields.
     """
     with open(path) as f:
         raw = json.load(f)
@@ -123,7 +130,7 @@ def load_scheduler_config(path: str) -> Dict[str, Any]:
         ))
 
     keys = [s.key for s in strategies]
-    if len(set(keys)) != len(keys):
+    if not allow_duplicate_strategy_keys and len(set(keys)) != len(keys):
         raise ValueError(f"{path}: duplicate (tp, pp) entries in 'strategies'")
 
     # switch_time_s: prefer 'average_reshard_wall_time_s' (output of the
@@ -148,6 +155,8 @@ def load_scheduler_config(path: str) -> Dict[str, Any]:
         'seconds_per_forecast_bucket': (float(raw['seconds_per_forecast_bucket'])
                                         if 'seconds_per_forecast_bucket' in raw
                                         else None),
+        'min_dwell_steps':             (int(raw['min_dwell_steps'])
+                                        if 'min_dwell_steps' in raw else None),
     }
 
 
@@ -312,6 +321,20 @@ def update_args_for_strategy(args, strategy: Strategy, ckpt_dir: str,
         args.load = ckpt_dir
 
 
+def default_node_local_ckpt_dir() -> str:
+    """Pick a node-local directory for temporary elastic checkpoints."""
+    scratch_base = (
+        os.environ.get('SLURM_TMPDIR')
+        or os.environ.get('TMPDIR')
+        or os.environ.get('TMP')
+        or os.environ.get('TEMP')
+        or '/tmp'
+    )
+    job_id = os.environ.get('SLURM_JOB_ID') or os.environ.get('SLURM_JOBID')
+    suffix = f"elastic_training_{job_id}" if job_id else "elastic_training"
+    return os.path.join(scratch_base, suffix, 'elastic_ckpt')
+
+
 # ═══════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════
@@ -320,7 +343,12 @@ def main():
     # ── 1. Pull elastic-only args off sys.argv before Megatron sees it ──
     elastic_parser = argparse.ArgumentParser(add_help=False)
     elastic_parser.add_argument('--elastic-work-dir',
-                                default='/tmp/elastic_training')
+                                default='/tmp/elastic_training',
+                                help='Directory for durable result JSON files')
+    elastic_parser.add_argument('--elastic-ckpt-dir',
+                                default=None,
+                                help='Directory for temporary reshard checkpoints '
+                                     '(default: node-local scratch)')
     elastic_parser.add_argument('--scheduler-config', required=True,
                                 help='Path to calibration JSON from '
                                      'profile_strategies.py')
@@ -328,6 +356,10 @@ def main():
                                 help='Path to CSV with hourly CI forecast '
                                      '(columns: year,month,day,time,carbon)')
     # Policy parameters — required (CLI or JSON), CLI takes precedence.
+    elastic_parser.add_argument('--scheduler-type',
+                                choices=('greedy', 'naive'),
+                                default='greedy',
+                                help='Scheduler policy to use.')
     elastic_parser.add_argument('--switch-power-w',     type=float, default=None,
                                 help='Power draw during reshard window (W). '
                                      'Overrides JSON switch_power_w.')
@@ -347,11 +379,20 @@ def main():
                                      'for ablations.')
     elastic_parser.add_argument('--bucket-seconds',     type=float, default=None,
                                 help='Wall seconds per CI forecast row '
-                                     '(default 3600). Overrides JSON '
-                                     'seconds_per_forecast_bucket.')
+                                     '(default 3600). Greedy-only; naive '
+                                     'uses progress-based mapping. Overrides '
+                                     'JSON seconds_per_forecast_bucket.')
+    elastic_parser.add_argument('--min-dwell-steps',    type=int,   default=None,
+                                help='Naive-only: minimum-dwell smoothing '
+                                     'window in steps. CI is averaged over '
+                                     '[step, step+min_dwell_steps] before '
+                                     'classifying the bucket, so brief '
+                                     'spikes/dips do not trigger resharding. '
+                                     'Default 0 (no smoothing). Overrides '
+                                     'JSON min_dwell_steps.')
     elastic_args, megatron_argv = elastic_parser.parse_known_args()
 
-    ckpt_dir = os.path.join(elastic_args.elastic_work_dir, 'elastic_ckpt')
+    ckpt_dir = elastic_args.elastic_ckpt_dir or default_node_local_ckpt_dir()
 
     extra_megatron = [
         '--ckpt-format', 'torch_dist',
@@ -365,7 +406,11 @@ def main():
     sys.argv = [sys.argv[0]] + megatron_argv + extra_megatron
 
     # ── 2. Load configs (cheap, before Megatron init so errors show fast) ──
-    cfg = load_scheduler_config(elastic_args.scheduler_config)
+    is_naive_scheduler = elastic_args.scheduler_type == 'naive'
+    cfg = load_scheduler_config(
+        elastic_args.scheduler_config,
+        allow_duplicate_strategy_keys=is_naive_scheduler,
+    )
     ci_hourly = load_carbon_forecast(elastic_args.carbon_forecast)
 
     # Resolve policy params: CLI > JSON > built-in default. Required params
@@ -385,16 +430,20 @@ def main():
     strategies                  = cfg['strategies']
     switch_time_s               = resolve(elastic_args.switch_time_seconds,
                                           cfg['switch_time_s'],
-                                          'switch-time-seconds')
+                                          'switch-time-seconds',
+                                          default=0.0 if is_naive_scheduler else None)
     switch_power_w              = resolve(elastic_args.switch_power_w,
                                           cfg['switch_power_w'],
-                                          'switch-power-w')
+                                          'switch-power-w',
+                                          default=0.0 if is_naive_scheduler else None)
     deadline_s                  = resolve(elastic_args.deadline_seconds,
                                           cfg['deadline_s'],
-                                          'deadline-seconds')
+                                          'deadline-seconds',
+                                          default=0.0 if is_naive_scheduler else None)
     lookahead_steps             = resolve(elastic_args.lookahead_steps,
                                           cfg['lookahead_steps'],
-                                          'lookahead-steps')
+                                          'lookahead-steps',
+                                          default=0 if is_naive_scheduler else None)
     decide_every                = resolve(elastic_args.decide_every,
                                           cfg['decide_every'],
                                           'decide-every')
@@ -402,6 +451,11 @@ def main():
                                           cfg['seconds_per_forecast_bucket'],
                                           'bucket-seconds',
                                           default=3600.0)
+    # Naive-only; harmless when greedy is selected.
+    min_dwell_steps             = resolve(elastic_args.min_dwell_steps,
+                                          cfg['min_dwell_steps'],
+                                          'min-dwell-steps',
+                                          default=0)
 
     # ── 3. Initialize Megatron (one-time cost) ──────────────────
     from megatron.training.initialize import initialize_megatron
@@ -456,17 +510,28 @@ def main():
         sys.exit(1)
 
     # ── 6. Instantiate the online scheduler ─────────────────────
-    sched = GreedyScheduler(
-        strategies=strategies,
-        switch_time_s=switch_time_s,
-        switch_power_w=switch_power_w,
-        total_steps=total_steps,
-        deadline_s=deadline_s,
-        ci_forecast_hourly_gco2_per_kwh=ci_hourly,
-        lookahead_steps=lookahead_steps,
-        initial_strategy_idx=initial_idx,
-        seconds_per_forecast_bucket=seconds_per_forecast_bucket,
-    )
+    if is_naive_scheduler:
+        sched = NaiveScheduler(
+            strategies=strategies,
+            ci_forecast_hourly_gco2_per_kwh=ci_hourly,
+            total_steps=total_steps,
+            initial_strategy_idx=initial_idx,
+            switch_time_s=switch_time_s,
+            switch_power_w=switch_power_w,
+            min_dwell_steps=min_dwell_steps,
+        )
+    else:
+        sched = GreedyScheduler(
+            strategies=strategies,
+            switch_time_s=switch_time_s,
+            switch_power_w=switch_power_w,
+            total_steps=total_steps,
+            deadline_s=deadline_s,
+            ci_forecast_hourly_gco2_per_kwh=ci_hourly,
+            lookahead_steps=lookahead_steps,
+            initial_strategy_idx=initial_idx,
+            seconds_per_forecast_bucket=seconds_per_forecast_bucket,
+        )
 
     # ── 7. Start NVML power sampler (per-rank, local device) ────
     power_sampler = NvmlPowerSampler(gpu_index=local_rank)
@@ -474,25 +539,38 @@ def main():
 
     if rank == 0:
         print("\n" + "=" * 70)
-        print("  ONLINE ELASTIC 3D PARALLELISM (greedy carbon-aware)")
+        policy_name = "naive bucket" if is_naive_scheduler else "greedy"
+        print(f"  ONLINE ELASTIC 3D PARALLELISM ({policy_name} carbon-aware)")
         print("=" * 70)
         print(f"  GPUs:              {n_gpus}")
         print(f"  Total steps:       {total_steps}")
-        print(f"  Deadline:          {deadline_s/3600:.2f} h ({deadline_s:.0f}s)")
+        if not is_naive_scheduler:
+            print(f"  Deadline:          {deadline_s/3600:.2f} h ({deadline_s:.0f}s)")
         print(f"  Decide every:      {decide_every} steps")
-        print(f"  Lookahead:         {lookahead_steps} steps")
+        if not is_naive_scheduler:
+            print(f"  Lookahead:         {lookahead_steps} steps")
         print(f"  Switch cost:       {switch_time_s}s @ {switch_power_w}W")
-        print(f"  Bucket size:       {seconds_per_forecast_bucket}s "
-              f"(forecast row → wall-time mapping)")
+        if is_naive_scheduler:
+            print(f"  Min dwell:         {min_dwell_steps} steps "
+                  f"(CI smoothing window)")
+            print(f"  Mapping:           progress-based "
+                  f"(step / {total_steps} → CSV row)")
+        else:
+            print(f"  Bucket size:       {seconds_per_forecast_bucket}s "
+                  f"(forecast row → wall-time mapping)")
         print(f"  Megatron init:     {t_init:.1f}s (one-time cost)")
         print(f"  Checkpoint dir:    {ckpt_dir}")
         print(f"  Scheduler config:  {elastic_args.scheduler_config}")
         print(f"  Carbon forecast:   {elastic_args.carbon_forecast} "
               f"({len(ci_hourly)} buckets)")
-        print(f"  Strategy menu:     {len(strategies)} candidates")
-        for s in strategies:
+        if is_naive_scheduler:
+            print("  Strategy menu:     low / medium / high")
+        else:
+            print(f"  Strategy menu:     {len(strategies)} candidates")
+        for i, s in enumerate(strategies):
             tag = "← initial" if s is strategies[initial_idx] else ""
-            print(f"    TP={s.tp} PP={s.pp}  P≈{s.power_w}W  τ≈{s.step_time_s}s  {tag}")
+            bucket = ("low", "medium", "high")[i] if is_naive_scheduler else f"{i}"
+            print(f"    {bucket}: TP={s.tp} PP={s.pp}  P≈{s.power_w}W  τ≈{s.step_time_s}s  {tag}")
         print("=" * 70 + "\n", flush=True)
 
     # ── 8. Drive phases until we reach total_steps ──────────────
@@ -653,7 +731,10 @@ def main():
                 post = sched._ops[current.key]
 
                 if rank == 0:
-                    ci_now = sched.ci_at(wall_time) * 3.6e6
+                    if is_naive_scheduler:
+                        ci_now = sched.ci_at_step(iteration) * 3.6e6
+                    else:
+                        ci_now = sched.ci_at(wall_time) * 3.6e6
                     print(f"    [observe] {steps_in_window} steps  "
                           f"meas: P={measured_power:.0f}W τ={measured_step_time:.3f}s  |  "
                           f"EMA: P {pre.power_w:.0f}→{post.power_w:.0f}W "
@@ -668,47 +749,47 @@ def main():
                 # sched.current — both must match what decide() sees internally,
                 # otherwise the displayed ★ can disagree with the actual choice.
                 if rank == 0:
-                    H_eff = min(lookahead_steps, total_steps - iteration)
-                    remaining_steps_cur = total_steps - iteration
-                    remaining_time_cur = deadline_s - wall_time
-                    fastest_tau = min(s.step_time_s for s in sched.strategies)
-                    slack = remaining_time_cur - remaining_steps_cur * fastest_tau
+                    if is_naive_scheduler:
+                        bucket = sched.carbon_bucket_at_step(iteration)
+                        ci_now = sched.ci_at_step(iteration) * 3.6e6
+                        progress = iteration / total_steps
+                        print(f"    [scheduler] step {iteration}/{total_steps} "
+                              f"({progress:.1%}), CI≈{ci_now:.0f} gCO2/kWh "
+                              f"→ {bucket} bucket "
+                              f"(dwell={min_dwell_steps} steps)",
+                              flush=True)
+                    else:
+                        H_eff = min(lookahead_steps, total_steps - iteration)
+                        remaining_steps_cur = total_steps - iteration
+                        remaining_time_cur = deadline_s - wall_time
+                        fastest_tau = min(s.step_time_s for s in sched.strategies)
+                        slack = remaining_time_cur - remaining_steps_cur * fastest_tau
 
-                    # Sample CI across the *current* strategy's lookahead window
-                    # so we can see whether temporal variation is visible to the
-                    # policy at this decision point. Use sched.current's τ for
-                    # the window length.
-                    cur = sched.current
-                    window_dur_la = H_eff * cur.step_time_s
-                    ci_samples = [sched.ci_at(wall_time + frac * window_dur_la) * 3.6e6
-                                  for frac in (0.0, 0.5, 1.0)]
+                        cur = sched.current
+                        window_dur_la = H_eff * cur.step_time_s
+                        ci_samples = [sched.ci_at(wall_time + frac * window_dur_la) * 3.6e6
+                                      for frac in (0.0, 0.5, 1.0)]
 
-                    print(f"    [scheduler] H={H_eff}, t={wall_time:.1f}s, "
-                          f"CI in window: {ci_samples[0]:.0f}→{ci_samples[1]:.0f}→"
-                          f"{ci_samples[2]:.0f} gCO2/kWh, "
-                          f"slack={slack:.1f}s", flush=True)
+                        print(f"    [scheduler] H={H_eff}, t={wall_time:.1f}s, "
+                              f"CI in window: {ci_samples[0]:.0f}→{ci_samples[1]:.0f}→"
+                              f"{ci_samples[2]:.0f} gCO2/kWh, "
+                              f"slack={slack:.1f}s", flush=True)
 
-                    # Compute cost for each candidate using the SAME state
-                    # decide() will use: EMA-updated operating points
-                    # (sched.strategies) and the scheduler's internal current
-                    # (sched.current). This guarantees the displayed ★ matches
-                    # the action taken by decide() on the next line.
-                    costs = []
-                    for s in sched.strategies:
-                        cost = sched._lookahead_carbon(s, sched.current,
-                                                      wall_time, H_eff)
-                        feas = (s.step_time_s * remaining_steps_cur
-                                <= remaining_time_cur)
-                        costs.append((s, cost, feas))
+                        costs = []
+                        for s in sched.strategies:
+                            cost = sched._lookahead_carbon(s, sched.current,
+                                                          wall_time, H_eff)
+                            feas = (s.step_time_s * remaining_steps_cur
+                                    <= remaining_time_cur)
+                            costs.append((s, cost, feas))
 
-                    # Sort cheapest-first so the rank ordering jumps out at a glance.
-                    costs.sort(key=lambda x: x[1])
-                    for rank_idx, (s, cost, feas) in enumerate(costs):
-                        action = "(stay)  " if s.key == sched.current.key else "(switch)"
-                        feas_tag = "        " if feas else "[INFEAS]"
-                        marker = "★" if rank_idx == 0 else " "
-                        print(f"    [scheduler] {marker} TP={s.tp} PP={s.pp} {action} {feas_tag} "
-                              f"→ {cost*1000:.2f} mgCO2 over {H_eff} steps", flush=True)
+                        costs.sort(key=lambda x: x[1])
+                        for rank_idx, (s, cost, feas) in enumerate(costs):
+                            action = "(stay)  " if s.key == sched.current.key else "(switch)"
+                            feas_tag = "        " if feas else "[INFEAS]"
+                            marker = "★" if rank_idx == 0 else " "
+                            print(f"    [scheduler] {marker} TP={s.tp} PP={s.pp} {action} {feas_tag} "
+                                  f"→ {cost*1000:.2f} mgCO2 over {H_eff} steps", flush=True)
 
                 # All ranks now see identical (measured_step_time, wall_time)
                 # → identical EMA state → identical decide() output. No
@@ -851,6 +932,8 @@ def main():
                 'switch_time_s': switch_time_s,
                 'switch_power_w': switch_power_w,
                 'seconds_per_forecast_bucket': seconds_per_forecast_bucket,
+                'min_dwell_steps': min_dwell_steps,
+                'scheduler_type': elastic_args.scheduler_type,
                 'scheduler_config_path': elastic_args.scheduler_config,
                 'carbon_forecast_path': elastic_args.carbon_forecast,
                 'phases': phase_results,

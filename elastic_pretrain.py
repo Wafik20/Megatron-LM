@@ -100,6 +100,20 @@ def schedule_needs_reshard(path):
     return False
 
 
+def default_node_local_ckpt_dir():
+    """Pick a node-local directory for temporary elastic checkpoints."""
+    scratch_base = (
+        os.environ.get('SLURM_TMPDIR')
+        or os.environ.get('TMPDIR')
+        or os.environ.get('TMP')
+        or os.environ.get('TEMP')
+        or '/tmp'
+    )
+    job_id = os.environ.get('SLURM_JOB_ID') or os.environ.get('SLURM_JOBID')
+    suffix = f"elastic_training_{job_id}" if job_id else "elastic_training"
+    return os.path.join(scratch_base, suffix, 'elastic_ckpt')
+
+
 # ═══════════════════════════════════════════════════════════════
 # NCCL Group Cleanup
 # ═══════════════════════════════════════════════════════════════
@@ -440,10 +454,14 @@ def main():
                                 help='Path to schedule JSON')
     elastic_parser.add_argument('--elastic-work-dir',
                                 default='/tmp/elastic_training',
-                                help='Directory for checkpoints and results')
+                                help='Directory for durable result JSON files')
+    elastic_parser.add_argument('--elastic-ckpt-dir',
+                                default=None,
+                                help='Directory for temporary reshard checkpoints '
+                                     '(default: node-local scratch)')
     elastic_args, megatron_argv = elastic_parser.parse_known_args()
 
-    ckpt_dir = os.path.join(elastic_args.elastic_work_dir, 'elastic_ckpt')
+    ckpt_dir = elastic_args.elastic_ckpt_dir or default_node_local_ckpt_dir()
 
     # Only request fully-reshardable optimizer checkpoints when the schedule
     # actually changes (TP, PP) between phases. Reshardable saves require an
