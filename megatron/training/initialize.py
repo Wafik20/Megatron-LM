@@ -65,6 +65,7 @@ def initialize_megatron(
     skip_dependency_compilation=False,
     *,
     training: bool = False,
+    model_parallel_order: Optional[str] = None,
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
@@ -75,6 +76,7 @@ def initialize_megatron(
     use the C++ dataset helpers.
     `training` enables training rerun, checkpoint workers, autoresume and dataset
     compilation in addition to the shared distributed execution and RNG setup.
+    model_parallel_order optionally overrides the existing rank-order selection.
     Returns a function to finalize distributed env initialization
     (optionally, only when args.lazy_mpu_init == True)
     """
@@ -143,6 +145,7 @@ def initialize_megatron(
             get_position_embedding_ranks,
             store,
             skip_model_parallel_init=skip_model_parallel_init,
+            model_parallel_order=model_parallel_order,
         )
 
         # Single-rank log helpers write on rank 0 by default. Non-colocated MIMO puts the
@@ -311,7 +314,7 @@ def _initialize_tp_communicators():
 
 
 def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store,
-                            skip_model_parallel_init=False):
+                            skip_model_parallel_init=False, model_parallel_order=None):
     """Initialize torch.distributed and core model parallel."""
     args = get_args()
 
@@ -397,6 +400,9 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             init_process_group_kwargs['backend'] = 'fake'
             init_process_group_kwargs['store'] = store
 
+        # Bind NCCL barriers to the selected visible device instead of rank-based guessing.
+        if args.distributed_backend == 'nccl' and not args.fake_process_group and device_id is not None:
+            init_process_group_kwargs['device_id'] = device_id
         torch.distributed.init_process_group(**init_process_group_kwargs)
         inprocess_restart.maybe_force_nccl_backend_init(device_id)
 
@@ -435,7 +441,9 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 expert_tensor_parallel_size=args.expert_tensor_parallel_size,
                 distributed_timeout_minutes=args.distributed_timeout_minutes,
                 nccl_communicator_config_path=args.nccl_communicator_config_path,
-                order='tp-cp-ep-dp-pp' if not args.use_tp_pp_dp_mapping else 'tp-cp-ep-pp-dp',
+                order=model_parallel_order or (
+                    'tp-cp-ep-dp-pp' if not args.use_tp_pp_dp_mapping else 'tp-cp-ep-pp-dp'
+                ),
                 get_embedding_ranks=get_embedding_ranks,
                 get_position_embedding_ranks=get_position_embedding_ranks,
                 create_gloo_process_groups=args.use_gloo_process_groups,
